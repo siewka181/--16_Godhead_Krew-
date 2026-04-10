@@ -5,6 +5,7 @@ Cel:
 - Symulacja 1.2M agentów z API po stronie "serwera" (kontroler sesji).
 - Praca na TPU przez `jax.pmap` (gdy dostępne), z fallbackiem na CPU/GPU.
 - Kod gotowy do użycia w Colab jako backend do notebookowych komórek klienckich.
+- Dodatkowo: obsługa Flask + ngrok do zdalnego sterowania backendem przez HTTP.
 
 Szybki start (Colab TPU):
 1) Runtime -> Change runtime type -> TPU
@@ -158,6 +159,61 @@ class Omega16Server:
         self.local_agents = self.cfg.total_agents // self.device_count
         self.initialized = False
         self.state: SwarmState | None = None
+        self._master_key = jax.random.PRNGKey(0) if self.jax_available else None
+
+    def startup_report(self) -> Dict[str, str | int | float | dict]:
+        """Raport startowy (techniczny) dla monitoringu Ω-16."""
+        return {
+            "mode": "OMEGA16_TECHNICAL_AUDIT",
+            "version": self.audit.version,
+            "architect": self.audit.architect,
+            "persona": self.audit.persona,
+            "hardware": self.audit.hardware,
+            "delta_t": self.audit.delta_t,
+            "gnn_recursion_limit": self.audit.gnn_recursion_limit,
+            "thermal_shield": self.audit.thermal_shield,
+            "hunter_cells_active": self.audit.hunter_cells_active,
+            "genome": decode_genome_payload(self.audit.genome_b64),
+            "jax_available": self.jax_available,
+            "backend": self.backend,
+            "model_note": "Swarm state is a vectorized JAX array, not an autonomous system.",
+            "status": "READY",
+        }
+
+    def sync_audit_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Synchronizuje runtime z zewnętrznym payloadem audytowym."""
+        if not isinstance(payload, dict):
+            raise ValueError("Payload audytowy musi być obiektem JSON.")
+        self.runtime_payload = payload
+        return {
+            "ok": True,
+            "synced_version": payload.get("version", "UNKNOWN"),
+            "timestamp": payload.get("timestamp", "UNKNOWN"),
+            "modules_count": len(payload.get("modules", {})) if isinstance(payload.get("modules", {}), dict) else 0,
+        }
+
+    def audit_state(self) -> Dict[str, Any]:
+        """Zwraca aktualny stan synchronizacji audytowej."""
+        return {
+            "profile_version": self.audit.version,
+            "runtime_synced": bool(self.runtime_payload),
+            "runtime_payload_version": self.runtime_payload.get("version") if self.runtime_payload else None,
+            "runtime_payload_timestamp": self.runtime_payload.get("timestamp") if self.runtime_payload else None,
+        }
+
+    def technical_summary(self) -> Dict[str, Any]:
+        """Neutralne podsumowanie implementacji bez warstwy narracyjnej."""
+        return {
+            "simulation_type": "vectorized multi-agent dynamics",
+            "state_backend": "JAX arrays",
+            "parallelism": "jax.pmap (if available), single-device fallback otherwise",
+            "checkpointing": "handled by caller/notebook workflow",
+            "not_sentient": True,
+        }
+
+    def initialize(self, seed: int = 2026) -> Dict[str, int | float]:
+        """Inicjalizacja świata i agentów."""
+        _require_jax()
         self._master_key = jax.random.PRNGKey(0)
 
     def initialize(self, seed: int = 2026) -> Dict[str, int | float]:
