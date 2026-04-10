@@ -10,30 +10,18 @@ Cel:
 Szybki start (Colab TPU):
 1) Runtime -> Change runtime type -> TPU
 2) !pip -q install -U "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
-3) (API HTTP) !pip -q install flask pyngrok
-4) from omega16_tpu_colab import Omega16Config, Omega16Server, create_app, run_with_ngrok
+3) from omega16_tpu_colab import Omega16Config, Omega16Server
 """
 
 from __future__ import annotations
 
-import threading
 import time
-import base64
-import json
-import io
-import os
-import warnings
 from dataclasses import dataclass
-from typing import Any, Dict, Tuple
+from typing import Dict, Tuple
 
-try:
-    import jax
-    import jax.numpy as jnp
-    from jax import lax
-except ModuleNotFoundError:  # pragma: no cover - środowiska bez JAX (np. lokalny CI)
-    jax = None
-    jnp = None
-    lax = None
+import jax
+import jax.numpy as jnp
+from jax import lax
 
 
 # =========================
@@ -58,44 +46,11 @@ class Omega16Config:
     avoid_radius: float = 0.02
 
 
-@dataclass(frozen=True)
-class AuditProfile:
-    """Parametry operacyjne dla technicznego audytu Ω-16."""
-
-    architect: str = "Grzegorz Siewicz"
-    persona: str = "technical-audit"
-    hardware: str = "Samsung A13"
-    delta_t: float = 0.042
-    gnn_recursion_limit: int = 64
-    thermal_shield: str = "SIG_THERM_045_SHIELD"
-    hunter_cells_active: int = 800_000
-    version: str = "L41_RECURSIVE_TRANSCENDENT_SELF"
-    genome_b64: str = (
-        "eyJ2ZXJzaW9uIjogIkwzOCIsICJ0cyI6ICIyMDI2LTA0LTA1IDA4OjI0OjAwIiwgImRfdCI6IDAuMDQyLCAic3RhdHVzIjog"
-        "IlNUQUJMRV9FVk9MVklORyIsICJzd2FybSI6ICI4MDBrX0FDVElWRV9IVU5URVJTIn0="
-    )
-
-
 @dataclass
 class SwarmState:
     pos: jnp.ndarray  # [devices, local_agents, 2]
     vel: jnp.ndarray  # [devices, local_agents, 2]
     step: jnp.ndarray  # scalar int32
-
-
-def decode_genome_payload(genome_b64: str) -> Dict[str, str | int | float]:
-    """Dekoduje genom base64(JSON) do słownika."""
-    try:
-        raw = base64.b64decode(genome_b64).decode("utf-8")
-        data = json.loads(raw)
-        return data
-    except Exception:
-        return {"raw": genome_b64, "decode_status": "failed"}
-
-
-def _require_jax() -> None:
-    if jax is None or jnp is None or lax is None:
-        raise RuntimeError("JAX nie jest zainstalowany. Zainstaluj `jax`/`jaxlib` aby uruchomić symulację.")
 
 
 # =========================
@@ -105,7 +60,6 @@ def _require_jax() -> None:
 
 def _init_local_agents(local_agents: int, key: jnp.ndarray, world_size: float) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """Inicjalizacja shardu agentów."""
-    _require_jax()
     k1, k2 = jax.random.split(key)
     pos = jax.random.uniform(
         k1,
@@ -132,7 +86,6 @@ def _omega16_local_dynamics(
 
     Uwaga: to model przybliżony, zaprojektowany pod dużą skalę (1.2M).
     """
-    _require_jax()
     center = jnp.mean(pos, axis=0, keepdims=True)
     avg_vel = jnp.mean(vel, axis=0, keepdims=True)
 
@@ -161,7 +114,6 @@ def _omega16_local_dynamics(
 
 def _pmap_step_fn(local_pos: jnp.ndarray, local_vel: jnp.ndarray, key: jnp.ndarray, cfg: Omega16Config):
     """Krok symulacji wykonywany równolegle per urządzenie."""
-    _require_jax()
     new_pos, new_vel = _omega16_local_dynamics(local_pos, local_vel, key, cfg)
 
     # Cross-shard globalne centrum (all-reduce)
@@ -172,12 +124,12 @@ def _pmap_step_fn(local_pos: jnp.ndarray, local_vel: jnp.ndarray, key: jnp.ndarr
 
 
 # Statyczny pmap kompilowany raz na proces
-_PMAP_STEP = jax.pmap(_pmap_step_fn, axis_name="devices", static_broadcasted_argnums=(3,)) if jax is not None else None
+_PMAP_STEP = jax.pmap(_pmap_step_fn, axis_name="devices", static_broadcasted_argnums=(3,))
 
 
+@jax.jit
 def _single_device_step(pos: jnp.ndarray, vel: jnp.ndarray, key: jnp.ndarray, cfg: Omega16Config):
     """Fallback dla 1 urządzenia (CPU/GPU) bez pmap."""
-    _require_jax()
     return _omega16_local_dynamics(pos, vel, key, cfg)
 
 
@@ -197,23 +149,9 @@ class Omega16Server:
     - snapshot(sample)
     """
 
-    def __init__(self, config: Omega16Config = Omega16Config(), audit: AuditProfile = AuditProfile()):
+    def __init__(self, config: Omega16Config = Omega16Config()):
         self.cfg = config
-        self.audit = audit
-        self.runtime_payload: Dict[str, Any] = {}
-        self.jax_available = jax is not None
-        self.device_count = jax.device_count() if self.jax_available else 1
-        self.devices = jax.devices() if self.jax_available else []
-        self.backend = "none"
-        if self.jax_available:
-            platform_kinds = {d.platform for d in self.devices}
-            if "tpu" in platform_kinds:
-                self.backend = "tpu"
-            elif "gpu" in platform_kinds:
-                self.backend = "gpu"
-            else:
-                self.backend = "cpu"
-                warnings.warn("TPU not detected. Falling back to CPU backend.", RuntimeWarning)
+        self.device_count = jax.device_count()
         if self.cfg.total_agents % self.device_count != 0:
             raise ValueError(
                 f"total_agents={self.cfg.total_agents} musi dzielić się przez device_count={self.device_count}"
@@ -276,6 +214,10 @@ class Omega16Server:
     def initialize(self, seed: int = 2026) -> Dict[str, int | float]:
         """Inicjalizacja świata i agentów."""
         _require_jax()
+        self._master_key = jax.random.PRNGKey(0)
+
+    def initialize(self, seed: int = 2026) -> Dict[str, int | float]:
+        """Inicjalizacja świata i agentów."""
         self._master_key = jax.random.PRNGKey(seed)
 
         keys = jax.random.split(self._master_key, self.device_count + 1)
@@ -283,7 +225,6 @@ class Omega16Server:
         init_keys = keys[1:]
 
         if self.device_count > 1:
-
             def build_for_device(k):
                 return _init_local_agents(self.local_agents, k, self.cfg.world_size)
 
@@ -306,7 +247,6 @@ class Omega16Server:
 
     def tick(self, n_steps: int = 1) -> Dict[str, float | int]:
         """Wykonuje n kroków symulacji i zwraca telemetry."""
-        _require_jax()
         if not self.initialized or self.state is None:
             raise RuntimeError("Server nie został zainicjalizowany. Wywołaj initialize().")
         if n_steps <= 0:
@@ -328,8 +268,8 @@ class Omega16Server:
 
             state = SwarmState(pos=pos, vel=vel, step=state.step + 1)
 
-        # pojedynczy punkt synchronizacji po całej paczce kroków
-        state.step.block_until_ready()
+        # synchronizacja hosta
+        state.pos.block_until_ready()
         elapsed = time.time() - t0
         self.state = state
 
@@ -341,7 +281,6 @@ class Omega16Server:
 
     def metrics(self) -> Dict[str, float | int]:
         """Szybkie metryki globalne (serwer-side)."""
-        _require_jax()
         if self.state is None:
             raise RuntimeError("Brak stanu. Wywołaj initialize().")
 
@@ -350,22 +289,20 @@ class Omega16Server:
         mean_pos = jnp.mean(pos, axis=0)
         mean_speed = jnp.mean(jnp.linalg.norm(vel, axis=1))
         std_pos = jnp.std(pos, axis=0)
-        mean_pos_h, mean_speed_h, std_pos_h, step_h = jax.device_get((mean_pos, mean_speed, std_pos, self.state.step))
 
         return {
-            "step": int(step_h),
-            "mean_pos_x": float(mean_pos_h[0]),
-            "mean_pos_y": float(mean_pos_h[1]),
-            "mean_speed": float(mean_speed_h),
-            "std_pos_x": float(std_pos_h[0]),
-            "std_pos_y": float(std_pos_h[1]),
+            "step": int(jax.device_get(self.state.step)),
+            "mean_pos_x": float(jax.device_get(mean_pos[0])),
+            "mean_pos_y": float(jax.device_get(mean_pos[1])),
+            "mean_speed": float(jax.device_get(mean_speed)),
+            "std_pos_x": float(jax.device_get(std_pos[0])),
+            "std_pos_y": float(jax.device_get(std_pos[1])),
         }
 
     def snapshot(self, sample: int = 8192) -> Dict[str, jnp.ndarray | int]:
         """
         Zwraca mały wycinek danych do wizualizacji po stronie klienta notebooka.
         """
-        _require_jax()
         if self.state is None:
             raise RuntimeError("Brak stanu. Wywołaj initialize().")
         if sample <= 0:
@@ -382,199 +319,6 @@ class Omega16Server:
             "pos": jax.device_get(pos[idx]),
             "vel": jax.device_get(vel[idx]),
         }
-
-    def anomaly_report(self) -> Dict[str, str | float | int | bool]:
-        """Wykrywanie podstawowych anomalii termicznych/logicznych na podstawie metryk stanu."""
-        if self.state is None:
-            return {
-                "ok": False,
-                "initialized": False,
-                "anomaly": "STATE_NOT_INITIALIZED",
-                "recommendation": "Wywołaj /initialize przed monitorowaniem anomalii.",
-            }
-
-        m = self.metrics()
-        std_radius = (m["std_pos_x"] ** 2 + m["std_pos_y"] ** 2) ** 0.5
-        speed = m["mean_speed"]
-        thermal_risk = speed > (self.cfg.max_speed * 0.92)
-        drift_risk = std_radius > (self.cfg.world_size * 1.15)
-
-        if thermal_risk and drift_risk:
-            anomaly = "THERMAL_AND_DRIFT"
-        elif thermal_risk:
-            anomaly = "THERMAL_SPIKE"
-        elif drift_risk:
-            anomaly = "SWARM_DRIFT"
-        else:
-            anomaly = "NONE"
-
-        return {
-            "ok": anomaly == "NONE",
-            "initialized": True,
-            "step": m["step"],
-            "anomaly": anomaly,
-            "thermal_shield": self.audit.thermal_shield,
-            "delta_t": self.audit.delta_t,
-            "mean_speed": speed,
-            "std_radius": float(std_radius),
-            "max_speed": self.cfg.max_speed,
-        }
-
-
-# =========================
-# Flask + ngrok (HTTP API)
-# =========================
-
-
-def create_app(config: Omega16Config | None = None, api_key: str | None = None):
-    """Tworzy aplikację Flask udostępniającą API serwera Ω-16."""
-    from flask import Flask, jsonify, request
-
-    app = Flask(__name__)
-    server = Omega16Server(config or Omega16Config())
-    expected_api_key = api_key or os.getenv("OMEGA16_API_KEY", "omega16-dev-key")
-
-    def _error(message: str, status_code: int = 400):
-        return jsonify({"ok": False, "error": message}), status_code
-
-    @app.before_request
-    def _require_api_key():
-        key = request.headers.get("X-API-KEY")
-        if key != expected_api_key:
-            return _error("Unauthorized", status_code=401)
-
-    @app.get("/health")
-    def health():
-        return jsonify({"ok": True, "initialized": server.initialized, "backend": server.backend})
-
-    @app.get("/audit/startup")
-    def audit_startup_route():
-        return jsonify(server.startup_report())
-
-    @app.get("/audit/anomalies")
-    def audit_anomalies_route():
-        return jsonify(server.anomaly_report())
-
-    @app.get("/audit/state")
-    def audit_state_route():
-        return jsonify(server.audit_state())
-
-    @app.get("/audit/technical-summary")
-    def technical_summary_route():
-        return jsonify(server.technical_summary())
-
-    @app.post("/audit/sync")
-    def audit_sync_route():
-        payload = request.get_json(silent=True)
-        if payload is None:
-            return _error("Wymagany JSON payload dla /audit/sync.")
-        try:
-            return jsonify(server.sync_audit_payload(payload))
-        except ValueError as exc:
-            return _error(str(exc))
-
-    @app.post("/initialize")
-    def initialize_route():
-        payload = request.get_json(silent=True) or {}
-        try:
-            seed = int(payload.get("seed", 2026))
-        except (TypeError, ValueError):
-            return _error("Pole 'seed' musi być liczbą całkowitą.")
-        return jsonify(server.initialize(seed=seed))
-
-    @app.post("/tick")
-    def tick_route():
-        payload = request.get_json(silent=True) or {}
-        try:
-            n_steps = int(payload.get("n_steps", 1))
-        except (TypeError, ValueError):
-            return _error("Pole 'n_steps' musi być liczbą całkowitą.")
-        try:
-            return jsonify(server.tick(n_steps=n_steps))
-        except ValueError as exc:
-            return _error(str(exc))
-        except RuntimeError as exc:
-            return _error(str(exc), status_code=409)
-
-    @app.get("/metrics")
-    def metrics_route():
-        try:
-            return jsonify(server.metrics())
-        except RuntimeError as exc:
-            return _error(str(exc), status_code=409)
-
-    @app.get("/snapshot")
-    def snapshot_route():
-        import numpy as np
-
-        try:
-            sample = int(request.args.get("sample", 2048))
-        except (TypeError, ValueError):
-            return _error("Parametr 'sample' musi być liczbą całkowitą.")
-        try:
-            snap = server.snapshot(sample=sample)
-        except ValueError as exc:
-            return _error(str(exc))
-        except RuntimeError as exc:
-            return _error(str(exc), status_code=409)
-        pos_np = np.asarray(snap["pos"])
-        vel_np = np.asarray(snap["vel"])
-        pos_buffer = io.BytesIO()
-        vel_buffer = io.BytesIO()
-        np.save(pos_buffer, pos_np, allow_pickle=False)
-        np.save(vel_buffer, vel_np, allow_pickle=False)
-        pos_b64 = base64.b64encode(pos_buffer.getvalue()).decode("ascii")
-        vel_b64 = base64.b64encode(vel_buffer.getvalue()).decode("ascii")
-        return jsonify(
-            {
-                "step": int(snap["step"]),
-                "encoding": "npy+base64",
-                "pos_npy_b64": pos_b64,
-                "vel_npy_b64": vel_b64,
-            }
-        )
-
-    return app
-
-
-def run_with_ngrok(
-    app,
-    port: int = 8000,
-    auth_token: str | None = None,
-    ngrok_domain: str | None = None,
-    run_server_in_thread: bool = False,
-) -> str:
-    """
-    Uruchamia tunel ngrok i zwraca publiczny URL.
-
-    W Colab:
-      from omega16_tpu_colab import create_app, run_with_ngrok
-      app = create_app()
-      public_url = run_with_ngrok(app, port=8000, auth_token="...")
-      print(public_url)
-
-    Gdy run_server_in_thread=True, Flask startuje w tle i funkcja od razu
-    zwraca URL tunelu (wygodne do dalszego wykonywania komórek).
-    """
-    from pyngrok import ngrok
-
-    if auth_token:
-        ngrok.set_auth_token(auth_token)
-
-    tunnel = ngrok.connect(addr=port, bind_tls=True, domain=ngrok_domain)
-    public_url = tunnel.public_url
-    print(f"[ngrok] {public_url} -> http://127.0.0.1:{port}")
-
-    if run_server_in_thread:
-        thread = threading.Thread(
-            target=app.run,
-            kwargs={"host": "0.0.0.0", "port": port, "debug": False, "use_reloader": False},
-            daemon=True,
-        )
-        thread.start()
-    else:
-        app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
-    return public_url
 
 
 # =========================
