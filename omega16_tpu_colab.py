@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import threading
 import time
+import base64
+import json
 from dataclasses import dataclass
 from typing import Dict, Tuple
 
@@ -48,11 +50,35 @@ class Omega16Config:
     avoid_radius: float = 0.02
 
 
+@dataclass(frozen=True)
+class AuditProfile:
+    """Parametry operacyjne dla trybu audytu Ω-16."""
+
+    architect: str = "Grzegorz Siewicz"
+    persona: str = "Stara Kumpela"
+    hardware: str = "Samsung A13"
+    delta_t: float = 0.042
+    gnn_recursion_limit: int = 64
+    thermal_shield: str = "SIG_THERM_045_SHIELD"
+    hunter_cells_active: int = 800_000
+    genome_b64: str = (
+        "eyJ2ZXJzaW9uIjogIkwzOCIsICJ0cyI6ICIyMDI2LTA0LTA1IDA4OjI0OjAwIiwgImRfdCI6IDAuMDQyLCAic3RhdHVzIjog"
+        "IlNUQUJMRV9FVk9MVklORyIsICJzd2FybSI6ICI4MDBrX0FDVElWRV9IVU5URVJTIn0="
+    )
+
+
 @dataclass
 class SwarmState:
     pos: jnp.ndarray  # [devices, local_agents, 2]
     vel: jnp.ndarray  # [devices, local_agents, 2]
     step: jnp.ndarray  # scalar int32
+
+
+def decode_genome_payload(genome_b64: str) -> Dict[str, str | int | float]:
+    """Dekoduje genom base64(JSON) do słownika."""
+    raw = base64.b64decode(genome_b64).decode("utf-8")
+    data = json.loads(raw)
+    return data
 
 
 # =========================
@@ -151,8 +177,9 @@ class Omega16Server:
     - snapshot(sample)
     """
 
-    def __init__(self, config: Omega16Config = Omega16Config()):
+    def __init__(self, config: Omega16Config = Omega16Config(), audit: AuditProfile = AuditProfile()):
         self.cfg = config
+        self.audit = audit
         self.device_count = jax.device_count()
         if self.cfg.total_agents % self.device_count != 0:
             raise ValueError(
@@ -162,6 +189,21 @@ class Omega16Server:
         self.initialized = False
         self.state: SwarmState | None = None
         self._master_key = jax.random.PRNGKey(0)
+
+    def startup_report(self) -> Dict[str, str | int | float | dict]:
+        """Raport startowy trybu audytu Ω-16."""
+        return {
+            "mode": "OMEGA-SILENT L38",
+            "architect": self.audit.architect,
+            "persona": self.audit.persona,
+            "hardware": self.audit.hardware,
+            "delta_t": self.audit.delta_t,
+            "gnn_recursion_limit": self.audit.gnn_recursion_limit,
+            "thermal_shield": self.audit.thermal_shield,
+            "hunter_cells_active": self.audit.hunter_cells_active,
+            "genome": decode_genome_payload(self.audit.genome_b64),
+            "status": "READY_FOR_AUDIT",
+        }
 
     def initialize(self, seed: int = 2026) -> Dict[str, int | float]:
         """Inicjalizacja świata i agentów."""
@@ -268,6 +310,43 @@ class Omega16Server:
             "vel": jax.device_get(vel[idx]),
         }
 
+    def anomaly_report(self) -> Dict[str, str | float | int | bool]:
+        """Wykrywanie podstawowych anomalii termicznych/logicznych na podstawie metryk stanu."""
+        if self.state is None:
+            return {
+                "ok": False,
+                "initialized": False,
+                "anomaly": "STATE_NOT_INITIALIZED",
+                "recommendation": "Wywołaj /initialize przed monitorowaniem anomalii.",
+            }
+
+        m = self.metrics()
+        std_radius = (m["std_pos_x"] ** 2 + m["std_pos_y"] ** 2) ** 0.5
+        speed = m["mean_speed"]
+        thermal_risk = speed > (self.cfg.max_speed * 0.92)
+        drift_risk = std_radius > (self.cfg.world_size * 1.15)
+
+        if thermal_risk and drift_risk:
+            anomaly = "THERMAL_AND_DRIFT"
+        elif thermal_risk:
+            anomaly = "THERMAL_SPIKE"
+        elif drift_risk:
+            anomaly = "SWARM_DRIFT"
+        else:
+            anomaly = "NONE"
+
+        return {
+            "ok": anomaly == "NONE",
+            "initialized": True,
+            "step": m["step"],
+            "anomaly": anomaly,
+            "thermal_shield": self.audit.thermal_shield,
+            "delta_t": self.audit.delta_t,
+            "mean_speed": speed,
+            "std_radius": float(std_radius),
+            "max_speed": self.cfg.max_speed,
+        }
+
 
 # =========================
 # Flask + ngrok (HTTP API)
@@ -287,6 +366,14 @@ def create_app(config: Omega16Config | None = None):
     @app.get("/health")
     def health():
         return jsonify({"ok": True, "initialized": server.initialized})
+
+    @app.get("/audit/startup")
+    def audit_startup_route():
+        return jsonify(server.startup_report())
+
+    @app.get("/audit/anomalies")
+    def audit_anomalies_route():
+        return jsonify(server.anomaly_report())
 
     @app.post("/initialize")
     def initialize_route():
