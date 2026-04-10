@@ -57,10 +57,10 @@ class Omega16Config:
 
 @dataclass(frozen=True)
 class AuditProfile:
-    """Parametry operacyjne dla trybu audytu Ω-16."""
+    """Parametry operacyjne dla technicznego audytu Ω-16."""
 
     architect: str = "Grzegorz Siewicz"
-    persona: str = "Stara Kumpela"
+    persona: str = "technical-audit"
     hardware: str = "Samsung A13"
     delta_t: float = 0.042
     gnn_recursion_limit: int = 64
@@ -210,9 +210,9 @@ class Omega16Server:
         self._master_key = jax.random.PRNGKey(0) if self.jax_available else None
 
     def startup_report(self) -> Dict[str, str | int | float | dict]:
-        """Raport startowy trybu audytu Ω-16."""
+        """Raport startowy (techniczny) dla monitoringu Ω-16."""
         return {
-            "mode": "OMEGA-SILENT L41",
+            "mode": "OMEGA16_TECHNICAL_AUDIT",
             "version": self.audit.version,
             "architect": self.audit.architect,
             "persona": self.audit.persona,
@@ -223,7 +223,8 @@ class Omega16Server:
             "hunter_cells_active": self.audit.hunter_cells_active,
             "genome": decode_genome_payload(self.audit.genome_b64),
             "jax_available": self.jax_available,
-            "status": "READY_FOR_AUDIT",
+            "model_note": "Swarm state is a vectorized JAX array, not an autonomous system.",
+            "status": "READY",
         }
 
     def sync_audit_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -245,6 +246,16 @@ class Omega16Server:
             "runtime_synced": bool(self.runtime_payload),
             "runtime_payload_version": self.runtime_payload.get("version") if self.runtime_payload else None,
             "runtime_payload_timestamp": self.runtime_payload.get("timestamp") if self.runtime_payload else None,
+        }
+
+    def technical_summary(self) -> Dict[str, Any]:
+        """Neutralne podsumowanie implementacji bez warstwy narracyjnej."""
+        return {
+            "simulation_type": "vectorized multi-agent dynamics",
+            "state_backend": "JAX arrays",
+            "parallelism": "jax.pmap (if available), single-device fallback otherwise",
+            "checkpointing": "handled by caller/notebook workflow",
+            "not_sentient": True,
         }
 
     def initialize(self, seed: int = 2026) -> Dict[str, int | float]:
@@ -424,6 +435,10 @@ def create_app(config: Omega16Config | None = None):
     @app.get("/audit/state")
     def audit_state_route():
         return jsonify(server.audit_state())
+
+    @app.get("/audit/technical-summary")
+    def technical_summary_route():
+        return jsonify(server.technical_summary())
 
     @app.post("/audit/sync")
     def audit_sync_route():

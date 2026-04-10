@@ -45,6 +45,11 @@ class Omega16AuditApiTests(unittest.TestCase):
         self.assertTrue(sbody["runtime_synced"])
         self.assertEqual(sbody["runtime_payload_version"], payload["version"])
 
+        summary = self.client.get("/audit/technical-summary")
+        self.assertEqual(summary.status_code, 200)
+        tbody = summary.get_json()
+        self.assertTrue(tbody["not_sentient"])
+
 
 if __name__ == "__main__":
     unittest.main()
