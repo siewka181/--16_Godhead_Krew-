@@ -23,9 +23,14 @@ import json
 from dataclasses import dataclass
 from typing import Any, Dict, Tuple
 
-import jax
-import jax.numpy as jnp
-from jax import lax
+try:
+    import jax
+    import jax.numpy as jnp
+    from jax import lax
+except ModuleNotFoundError:  # pragma: no cover - środowiska bez JAX (np. lokalny CI)
+    jax = None
+    jnp = None
+    lax = None
 
 
 # =========================
@@ -85,6 +90,11 @@ def decode_genome_payload(genome_b64: str) -> Dict[str, str | int | float]:
         return {"raw": genome_b64, "decode_status": "failed"}
 
 
+def _require_jax() -> None:
+    if jax is None or jnp is None or lax is None:
+        raise RuntimeError("JAX nie jest zainstalowany. Zainstaluj `jax`/`jaxlib` aby uruchomić symulację.")
+
+
 # =========================
 # Niskopoziomowa fizyka roju
 # =========================
@@ -92,6 +102,7 @@ def decode_genome_payload(genome_b64: str) -> Dict[str, str | int | float]:
 
 def _init_local_agents(local_agents: int, key: jnp.ndarray, world_size: float) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """Inicjalizacja shardu agentów."""
+    _require_jax()
     k1, k2 = jax.random.split(key)
     pos = jax.random.uniform(
         k1,
@@ -118,6 +129,7 @@ def _omega16_local_dynamics(
 
     Uwaga: to model przybliżony, zaprojektowany pod dużą skalę (1.2M).
     """
+    _require_jax()
     center = jnp.mean(pos, axis=0, keepdims=True)
     avg_vel = jnp.mean(vel, axis=0, keepdims=True)
 
@@ -146,6 +158,7 @@ def _omega16_local_dynamics(
 
 def _pmap_step_fn(local_pos: jnp.ndarray, local_vel: jnp.ndarray, key: jnp.ndarray, cfg: Omega16Config):
     """Krok symulacji wykonywany równolegle per urządzenie."""
+    _require_jax()
     new_pos, new_vel = _omega16_local_dynamics(local_pos, local_vel, key, cfg)
 
     # Cross-shard globalne centrum (all-reduce)
@@ -156,12 +169,12 @@ def _pmap_step_fn(local_pos: jnp.ndarray, local_vel: jnp.ndarray, key: jnp.ndarr
 
 
 # Statyczny pmap kompilowany raz na proces
-_PMAP_STEP = jax.pmap(_pmap_step_fn, axis_name="devices", static_broadcasted_argnums=(3,))
+_PMAP_STEP = jax.pmap(_pmap_step_fn, axis_name="devices", static_broadcasted_argnums=(3,)) if jax is not None else None
 
 
-@jax.jit
 def _single_device_step(pos: jnp.ndarray, vel: jnp.ndarray, key: jnp.ndarray, cfg: Omega16Config):
     """Fallback dla 1 urządzenia (CPU/GPU) bez pmap."""
+    _require_jax()
     return _omega16_local_dynamics(pos, vel, key, cfg)
 
 
@@ -185,7 +198,8 @@ class Omega16Server:
         self.cfg = config
         self.audit = audit
         self.runtime_payload: Dict[str, Any] = {}
-        self.device_count = jax.device_count()
+        self.jax_available = jax is not None
+        self.device_count = jax.device_count() if self.jax_available else 1
         if self.cfg.total_agents % self.device_count != 0:
             raise ValueError(
                 f"total_agents={self.cfg.total_agents} musi dzielić się przez device_count={self.device_count}"
@@ -193,7 +207,7 @@ class Omega16Server:
         self.local_agents = self.cfg.total_agents // self.device_count
         self.initialized = False
         self.state: SwarmState | None = None
-        self._master_key = jax.random.PRNGKey(0)
+        self._master_key = jax.random.PRNGKey(0) if self.jax_available else None
 
     def startup_report(self) -> Dict[str, str | int | float | dict]:
         """Raport startowy trybu audytu Ω-16."""
@@ -208,6 +222,7 @@ class Omega16Server:
             "thermal_shield": self.audit.thermal_shield,
             "hunter_cells_active": self.audit.hunter_cells_active,
             "genome": decode_genome_payload(self.audit.genome_b64),
+            "jax_available": self.jax_available,
             "status": "READY_FOR_AUDIT",
         }
 
@@ -234,6 +249,7 @@ class Omega16Server:
 
     def initialize(self, seed: int = 2026) -> Dict[str, int | float]:
         """Inicjalizacja świata i agentów."""
+        _require_jax()
         self._master_key = jax.random.PRNGKey(seed)
 
         keys = jax.random.split(self._master_key, self.device_count + 1)
@@ -264,6 +280,7 @@ class Omega16Server:
 
     def tick(self, n_steps: int = 1) -> Dict[str, float | int]:
         """Wykonuje n kroków symulacji i zwraca telemetry."""
+        _require_jax()
         if not self.initialized or self.state is None:
             raise RuntimeError("Server nie został zainicjalizowany. Wywołaj initialize().")
         if n_steps <= 0:
@@ -298,6 +315,7 @@ class Omega16Server:
 
     def metrics(self) -> Dict[str, float | int]:
         """Szybkie metryki globalne (serwer-side)."""
+        _require_jax()
         if self.state is None:
             raise RuntimeError("Brak stanu. Wywołaj initialize().")
 
@@ -320,6 +338,7 @@ class Omega16Server:
         """
         Zwraca mały wycinek danych do wizualizacji po stronie klienta notebooka.
         """
+        _require_jax()
         if self.state is None:
             raise RuntimeError("Brak stanu. Wywołaj initialize().")
         if sample <= 0:
