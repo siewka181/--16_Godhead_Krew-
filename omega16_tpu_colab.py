@@ -16,6 +16,7 @@ Szybki start (Colab TPU):
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass
 from typing import Dict, Tuple
@@ -280,6 +281,9 @@ def create_app(config: Omega16Config | None = None):
     app = Flask(__name__)
     server = Omega16Server(config or Omega16Config())
 
+    def _error(message: str, status_code: int = 400):
+        return jsonify({"ok": False, "error": message}), status_code
+
     @app.get("/health")
     def health():
         return jsonify({"ok": True, "initialized": server.initialized})
@@ -287,23 +291,45 @@ def create_app(config: Omega16Config | None = None):
     @app.post("/initialize")
     def initialize_route():
         payload = request.get_json(silent=True) or {}
-        seed = int(payload.get("seed", 2026))
+        try:
+            seed = int(payload.get("seed", 2026))
+        except (TypeError, ValueError):
+            return _error("Pole 'seed' musi być liczbą całkowitą.")
         return jsonify(server.initialize(seed=seed))
 
     @app.post("/tick")
     def tick_route():
         payload = request.get_json(silent=True) or {}
-        n_steps = int(payload.get("n_steps", 1))
-        return jsonify(server.tick(n_steps=n_steps))
+        try:
+            n_steps = int(payload.get("n_steps", 1))
+        except (TypeError, ValueError):
+            return _error("Pole 'n_steps' musi być liczbą całkowitą.")
+        try:
+            return jsonify(server.tick(n_steps=n_steps))
+        except ValueError as exc:
+            return _error(str(exc))
+        except RuntimeError as exc:
+            return _error(str(exc), status_code=409)
 
     @app.get("/metrics")
     def metrics_route():
-        return jsonify(server.metrics())
+        try:
+            return jsonify(server.metrics())
+        except RuntimeError as exc:
+            return _error(str(exc), status_code=409)
 
     @app.get("/snapshot")
     def snapshot_route():
-        sample = int(request.args.get("sample", 2048))
-        snap = server.snapshot(sample=sample)
+        try:
+            sample = int(request.args.get("sample", 2048))
+        except (TypeError, ValueError):
+            return _error("Parametr 'sample' musi być liczbą całkowitą.")
+        try:
+            snap = server.snapshot(sample=sample)
+        except ValueError as exc:
+            return _error(str(exc))
+        except RuntimeError as exc:
+            return _error(str(exc), status_code=409)
         # JSON-friendly serializacja ndarray
         return jsonify(
             {
@@ -321,6 +347,7 @@ def run_with_ngrok(
     port: int = 8000,
     auth_token: str | None = None,
     ngrok_domain: str | None = None,
+    run_server_in_thread: bool = False,
 ) -> str:
     """
     Uruchamia tunel ngrok i zwraca publiczny URL.
@@ -330,6 +357,9 @@ def run_with_ngrok(
       app = create_app()
       public_url = run_with_ngrok(app, port=8000, auth_token="...")
       print(public_url)
+
+    Gdy run_server_in_thread=True, Flask startuje w tle i funkcja od razu
+    zwraca URL tunelu (wygodne do dalszego wykonywania komórek).
     """
     from pyngrok import ngrok
 
@@ -340,7 +370,15 @@ def run_with_ngrok(
     public_url = tunnel.public_url
     print(f"[ngrok] {public_url} -> http://127.0.0.1:{port}")
 
-    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+    if run_server_in_thread:
+        thread = threading.Thread(
+            target=app.run,
+            kwargs={"host": "0.0.0.0", "port": port, "debug": False, "use_reloader": False},
+            daemon=True,
+        )
+        thread.start()
+    else:
+        app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
     return public_url
 
 
