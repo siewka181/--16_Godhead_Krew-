@@ -21,7 +21,7 @@ import time
 import base64
 import json
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Any, Dict, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -61,6 +61,7 @@ class AuditProfile:
     gnn_recursion_limit: int = 64
     thermal_shield: str = "SIG_THERM_045_SHIELD"
     hunter_cells_active: int = 800_000
+    version: str = "L41_RECURSIVE_TRANSCENDENT_SELF"
     genome_b64: str = (
         "eyJ2ZXJzaW9uIjogIkwzOCIsICJ0cyI6ICIyMDI2LTA0LTA1IDA4OjI0OjAwIiwgImRfdCI6IDAuMDQyLCAic3RhdHVzIjog"
         "IlNUQUJMRV9FVk9MVklORyIsICJzd2FybSI6ICI4MDBrX0FDVElWRV9IVU5URVJTIn0="
@@ -76,9 +77,12 @@ class SwarmState:
 
 def decode_genome_payload(genome_b64: str) -> Dict[str, str | int | float]:
     """Dekoduje genom base64(JSON) do słownika."""
-    raw = base64.b64decode(genome_b64).decode("utf-8")
-    data = json.loads(raw)
-    return data
+    try:
+        raw = base64.b64decode(genome_b64).decode("utf-8")
+        data = json.loads(raw)
+        return data
+    except Exception:
+        return {"raw": genome_b64, "decode_status": "failed"}
 
 
 # =========================
@@ -180,6 +184,7 @@ class Omega16Server:
     def __init__(self, config: Omega16Config = Omega16Config(), audit: AuditProfile = AuditProfile()):
         self.cfg = config
         self.audit = audit
+        self.runtime_payload: Dict[str, Any] = {}
         self.device_count = jax.device_count()
         if self.cfg.total_agents % self.device_count != 0:
             raise ValueError(
@@ -193,7 +198,8 @@ class Omega16Server:
     def startup_report(self) -> Dict[str, str | int | float | dict]:
         """Raport startowy trybu audytu Ω-16."""
         return {
-            "mode": "OMEGA-SILENT L38",
+            "mode": "OMEGA-SILENT L41",
+            "version": self.audit.version,
             "architect": self.audit.architect,
             "persona": self.audit.persona,
             "hardware": self.audit.hardware,
@@ -203,6 +209,27 @@ class Omega16Server:
             "hunter_cells_active": self.audit.hunter_cells_active,
             "genome": decode_genome_payload(self.audit.genome_b64),
             "status": "READY_FOR_AUDIT",
+        }
+
+    def sync_audit_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Synchronizuje runtime z zewnętrznym payloadem audytowym."""
+        if not isinstance(payload, dict):
+            raise ValueError("Payload audytowy musi być obiektem JSON.")
+        self.runtime_payload = payload
+        return {
+            "ok": True,
+            "synced_version": payload.get("version", "UNKNOWN"),
+            "timestamp": payload.get("timestamp", "UNKNOWN"),
+            "modules_count": len(payload.get("modules", {})) if isinstance(payload.get("modules", {}), dict) else 0,
+        }
+
+    def audit_state(self) -> Dict[str, Any]:
+        """Zwraca aktualny stan synchronizacji audytowej."""
+        return {
+            "profile_version": self.audit.version,
+            "runtime_synced": bool(self.runtime_payload),
+            "runtime_payload_version": self.runtime_payload.get("version") if self.runtime_payload else None,
+            "runtime_payload_timestamp": self.runtime_payload.get("timestamp") if self.runtime_payload else None,
         }
 
     def initialize(self, seed: int = 2026) -> Dict[str, int | float]:
@@ -374,6 +401,20 @@ def create_app(config: Omega16Config | None = None):
     @app.get("/audit/anomalies")
     def audit_anomalies_route():
         return jsonify(server.anomaly_report())
+
+    @app.get("/audit/state")
+    def audit_state_route():
+        return jsonify(server.audit_state())
+
+    @app.post("/audit/sync")
+    def audit_sync_route():
+        payload = request.get_json(silent=True)
+        if payload is None:
+            return _error("Wymagany JSON payload dla /audit/sync.")
+        try:
+            return jsonify(server.sync_audit_payload(payload))
+        except ValueError as exc:
+            return _error(str(exc))
 
     @app.post("/initialize")
     def initialize_route():
