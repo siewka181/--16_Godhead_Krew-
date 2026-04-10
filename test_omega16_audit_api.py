@@ -24,8 +24,10 @@ class Omega16AuditApiTests(unittest.TestCase):
             import flask  # noqa: F401
         except ModuleNotFoundError:
             self.skipTest("Flask is not installed in this environment.")
-        self.app = create_app()
+        self.api_key = "test-key"
+        self.app = create_app(api_key=self.api_key)
         self.client = self.app.test_client()
+        self.headers = {"X-API-KEY": self.api_key}
 
     def test_audit_sync_and_state(self):
         payload = {
@@ -33,22 +35,26 @@ class Omega16AuditApiTests(unittest.TestCase):
             "timestamp": "2026-04-05T14:04:48.403710",
             "modules": {"01/CORE/IDENTITY_CELL.txt": {"length": 81}},
         }
-        r = self.client.post("/audit/sync", json=payload)
+        r = self.client.post("/audit/sync", json=payload, headers=self.headers)
         self.assertEqual(r.status_code, 200)
         body = r.get_json()
         self.assertTrue(body["ok"])
         self.assertEqual(body["synced_version"], payload["version"])
 
-        state = self.client.get("/audit/state")
+        state = self.client.get("/audit/state", headers=self.headers)
         self.assertEqual(state.status_code, 200)
         sbody = state.get_json()
         self.assertTrue(sbody["runtime_synced"])
         self.assertEqual(sbody["runtime_payload_version"], payload["version"])
 
-        summary = self.client.get("/audit/technical-summary")
+        summary = self.client.get("/audit/technical-summary", headers=self.headers)
         self.assertEqual(summary.status_code, 200)
         tbody = summary.get_json()
         self.assertTrue(tbody["not_sentient"])
+
+    def test_api_key_required(self):
+        r = self.client.get("/health")
+        self.assertEqual(r.status_code, 401)
 
 
 if __name__ == "__main__":

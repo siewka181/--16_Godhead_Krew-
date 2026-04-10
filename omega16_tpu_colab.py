@@ -20,6 +20,9 @@ import threading
 import time
 import base64
 import json
+import io
+import os
+import warnings
 from dataclasses import dataclass
 from typing import Any, Dict, Tuple
 
@@ -200,6 +203,17 @@ class Omega16Server:
         self.runtime_payload: Dict[str, Any] = {}
         self.jax_available = jax is not None
         self.device_count = jax.device_count() if self.jax_available else 1
+        self.devices = jax.devices() if self.jax_available else []
+        self.backend = "none"
+        if self.jax_available:
+            platform_kinds = {d.platform for d in self.devices}
+            if "tpu" in platform_kinds:
+                self.backend = "tpu"
+            elif "gpu" in platform_kinds:
+                self.backend = "gpu"
+            else:
+                self.backend = "cpu"
+                warnings.warn("TPU not detected. Falling back to CPU backend.", RuntimeWarning)
         if self.cfg.total_agents % self.device_count != 0:
             raise ValueError(
                 f"total_agents={self.cfg.total_agents} musi dzielić się przez device_count={self.device_count}"
@@ -223,6 +237,7 @@ class Omega16Server:
             "hunter_cells_active": self.audit.hunter_cells_active,
             "genome": decode_genome_payload(self.audit.genome_b64),
             "jax_available": self.jax_available,
+            "backend": self.backend,
             "model_note": "Swarm state is a vectorized JAX array, not an autonomous system.",
             "status": "READY",
         }
@@ -313,8 +328,8 @@ class Omega16Server:
 
             state = SwarmState(pos=pos, vel=vel, step=state.step + 1)
 
-        # synchronizacja hosta
-        state.pos.block_until_ready()
+        # pojedynczy punkt synchronizacji po całej paczce kroków
+        state.step.block_until_ready()
         elapsed = time.time() - t0
         self.state = state
 
@@ -335,14 +350,15 @@ class Omega16Server:
         mean_pos = jnp.mean(pos, axis=0)
         mean_speed = jnp.mean(jnp.linalg.norm(vel, axis=1))
         std_pos = jnp.std(pos, axis=0)
+        mean_pos_h, mean_speed_h, std_pos_h, step_h = jax.device_get((mean_pos, mean_speed, std_pos, self.state.step))
 
         return {
-            "step": int(jax.device_get(self.state.step)),
-            "mean_pos_x": float(jax.device_get(mean_pos[0])),
-            "mean_pos_y": float(jax.device_get(mean_pos[1])),
-            "mean_speed": float(jax.device_get(mean_speed)),
-            "std_pos_x": float(jax.device_get(std_pos[0])),
-            "std_pos_y": float(jax.device_get(std_pos[1])),
+            "step": int(step_h),
+            "mean_pos_x": float(mean_pos_h[0]),
+            "mean_pos_y": float(mean_pos_h[1]),
+            "mean_speed": float(mean_speed_h),
+            "std_pos_x": float(std_pos_h[0]),
+            "std_pos_y": float(std_pos_h[1]),
         }
 
     def snapshot(self, sample: int = 8192) -> Dict[str, jnp.ndarray | int]:
@@ -410,19 +426,26 @@ class Omega16Server:
 # =========================
 
 
-def create_app(config: Omega16Config | None = None):
+def create_app(config: Omega16Config | None = None, api_key: str | None = None):
     """Tworzy aplikację Flask udostępniającą API serwera Ω-16."""
     from flask import Flask, jsonify, request
 
     app = Flask(__name__)
     server = Omega16Server(config or Omega16Config())
+    expected_api_key = api_key or os.getenv("OMEGA16_API_KEY", "omega16-dev-key")
 
     def _error(message: str, status_code: int = 400):
         return jsonify({"ok": False, "error": message}), status_code
 
+    @app.before_request
+    def _require_api_key():
+        key = request.headers.get("X-API-KEY")
+        if key != expected_api_key:
+            return _error("Unauthorized", status_code=401)
+
     @app.get("/health")
     def health():
-        return jsonify({"ok": True, "initialized": server.initialized})
+        return jsonify({"ok": True, "initialized": server.initialized, "backend": server.backend})
 
     @app.get("/audit/startup")
     def audit_startup_route():
@@ -482,6 +505,8 @@ def create_app(config: Omega16Config | None = None):
 
     @app.get("/snapshot")
     def snapshot_route():
+        import numpy as np
+
         try:
             sample = int(request.args.get("sample", 2048))
         except (TypeError, ValueError):
@@ -492,12 +517,20 @@ def create_app(config: Omega16Config | None = None):
             return _error(str(exc))
         except RuntimeError as exc:
             return _error(str(exc), status_code=409)
-        # JSON-friendly serializacja ndarray
+        pos_np = np.asarray(snap["pos"])
+        vel_np = np.asarray(snap["vel"])
+        pos_buffer = io.BytesIO()
+        vel_buffer = io.BytesIO()
+        np.save(pos_buffer, pos_np, allow_pickle=False)
+        np.save(vel_buffer, vel_np, allow_pickle=False)
+        pos_b64 = base64.b64encode(pos_buffer.getvalue()).decode("ascii")
+        vel_b64 = base64.b64encode(vel_buffer.getvalue()).decode("ascii")
         return jsonify(
             {
                 "step": int(snap["step"]),
-                "pos": snap["pos"].tolist(),
-                "vel": snap["vel"].tolist(),
+                "encoding": "npy+base64",
+                "pos_npy_b64": pos_b64,
+                "vel_npy_b64": vel_b64,
             }
         )
 
